@@ -48,8 +48,8 @@
 // Two WiFi profiles, selected by WIFI_PIN at boot. Profile 1 sets a static
 // IP (192.168.1.{100+PLAYER_NUM}); profile 0 uses DHCP. RESPOND_TO is the
 // host that receives our UDP status replies for that profile.
-const char* WIFI_SSID[]  = {"EE219B", "Lightdance"};
-const char* WIFI_PASS    = "wifiyee219";
+const char* WIFI_SSID[]  = {"EE219B", "Lightdance"}; //"EE219B"
+const char* WIFI_PASS    = "wifiyee219"; //"wifiyee219"
 const char* RESPOND_TO[] = {"192.168.0.137", "192.168.1.10"};
 
 // Body-part -> LED mapping. Each row paints `count` LEDs, starting at index
@@ -85,6 +85,8 @@ String   deviceId;
 
 Adafruit_SSD1306 oled(128, 64, &Wire, -1);
 WiFiUDP udp;
+WiFiClientSecure httpsClient;
+HTTPClient       http;
 
 enum State { READY, PLAYING };
 State state = READY;
@@ -140,22 +142,17 @@ bool downloadChunk(int n) {
     String url = "https://eesa.dece.nycu.edu.tw/lightdance/api/items/eesa3/LATEST/player="
                  + String(PLAYER_NUM) + "/chunk=" + String(n);
 
-    WiFiClientSecure c;
-    c.setInsecure();  // server cert not validated
-
-    HTTPClient http;
-    http.begin(c, url);
+    http.begin(httpsClient, url);
 
     if (http.GET() != 200) {
         http.end();
         return false;
     }
 
-    StaticJsonDocument<4096> doc;
-    if (deserializeJson(doc, http.getString())) {
-        http.end();
-        return false;
-    }
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getStream());
+    http.end();
+    if (err) return false;
 
     // Index in KEYS[] = column in frames[][]. Order matters: the SECTIONS
     // table's `part` field references these positions directly.
@@ -173,7 +170,6 @@ bool downloadChunk(int n) {
         numFrames = idx + 1;
     }
 
-    http.end();
     return true;
 }
 
@@ -333,6 +329,8 @@ void setup() {
         loadData();
     } else {
         msg("Downloading...");
+        httpsClient.setInsecure();  // server cert not validated
+        http.setReuse(true);        // keep TCP/TLS alive across chunk requests
         for (int c = 0; c < NUM_CHUNKS; c++) {
             bool ok = false;
             for (int a = 0; a < 3 && !(ok = downloadChunk(c)); a++) {
