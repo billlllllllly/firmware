@@ -1,656 +1,403 @@
-#include <Adafruit_GFX.h>
+// LED costume controller for Pico W.
+//
+// Boot flow:
+//   1. init OLED + read DIP switches
+//   2. connect WiFi (skipped if DEBUG_PIN low so unit lights up offline)
+//   3. init FastLED + LittleFS
+//   4. branch on switches:
+//        DEBUG_PIN  (GPIO 18) low  -> show body-part test colors and halt
+//        DEBUG_PIN  (GPIO 18) high -> normal boot, continue below
+//        SWITCH_PIN (GPIO 17) low  -> load saved animation from flash, enter run loop
+//        SWITCH_PIN (GPIO 17) high -> download fresh data from server, save, halt
+//                                     (power-cycle with SWITCH_PIN low to play it back)
+//   5. run loop: listen on UDP, play back frames synced to host timestamps.
+//
+// WIFI_PIN (GPIO 20) is read only when DEBUG_PIN is high (i.e. WiFi is needed):
+//   high -> profile 0 (SSID "EE219B",     DHCP)
+//   low  -> profile 1 (SSID "Lightdance", static IP 192.168.1.{100+PLAYER_NUM})
+
 #include <Adafruit_SSD1306.h>
 #include <ArduinoJson.h>
-#include <EasyButton.h>
 #include <FastLED.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
-#include <math.h>
-#include <WiFiClientSecure.h>
-// #include "data.h"
-
 #include "hardware/watchdog.h"
 
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
+// ---- config ----
+// PLAYER_NUM identifies this unit; flash a unique value per costume.
+// All input pins use INPUT_PULLUP, so "low" = switch closed to GND.
+#define PLAYER_NUM     0
+#define SDA_PIN        12
+#define SCL_PIN        13
+#define DEBUG_PIN      18  // low = debug mode (offline test colors)  | high = normal boot
+#define SWITCH_PIN     17  // low = load from flash & run             | high = download & halt
+#define WIFI_PIN       20  // low = WiFi profile 1 (Lightdance)       | high = profile 0 (EE219B)
+#define MAX_FRAMES     1024
+#define CHUNK_SIZE     10
+#define NUM_CHUNKS     60
+#define UDP_RX_PORT    12345
+#define UDP_TX_PORT    12346
+#define UDP_STOP       1937010544u
+#define UDP_HEARTBEAT  1751474546u
+#define HEARTBEAT_MS   3000
 
+// Two WiFi profiles, selected by WIFI_PIN at boot. Profile 1 sets a static
+// IP (192.168.1.{100+PLAYER_NUM}); profile 0 uses DHCP. RESPOND_TO is the
+// host that receives our UDP status replies for that profile.
+const char* WIFI_SSID[]  = {"EE219B", "Lightdance"};
+const char* WIFI_PASS    = "wifiyee219";
+const char* RESPOND_TO[] = {"192.168.0.137", "192.168.1.10"};
 
-#define PLAYER_NUM 0
-
-// Pins
-#define SDA_PIN 12      // OLED display data
-#define SCL_PIN 13      // OLED display clock
-#define DEBUG_PIN 18        // Debug mode: LOW=show test colors
-#define SWITCH_PIN 17       // Mode select: HIGH=WiFi download, LOW=load from memory
-#define BUTTON_PIN 16       // Manual start button (pull-up)
-#define WIFI_PIN 20     // WiFi profile: HIGH=profile 0, LOW=profile 1
-
-// Display
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-#define SCREEN_ADDRESS 0x3C
-
-// Data
-#define MAX_FRAMES 1024
-#define CHUNK_SIZE 17
-#define BODY_PARTS 15
-#define NUM_CHUNKS 18
-
-// Network
-#define UDP_RX_PORT 12345
-#define UDP_TX_PORT 12346
-#define UDP_STOP_CMD 1937010544
-#define UDP_HEARTBEAT_CMD 1751474546
-#define HEARTBEAT_TIMEOUT 3000
-
-// WiFi Settings
-const char* WIFI_SSID[] = {"EE219B", "Lightdance"};      // "EE219B", "Lightdance"
-const char* WIFI_PASSWORD = "wifiyee219";     // "wifiyee219", "L
-const char* RESPONSE_ADDRESS[] = {"192.168.0.137", "192.168.1.10"};      // "192.168.0.137"
-
-// LED Section Mapping - combines all the separate arrays into one structure
-struct LEDSection {
-    int ledArrayIndex;    // Which LED strip (0-5)
-    int startPosition;    // Starting LED in that strip
-    int ledCount;         // Number of LEDs in this section
-    int bodyPartIndex;    // Which body part color to use (1-9)
+// Body-part -> LED mapping. Each row paints `count` LEDs, starting at index
+// `start` of `strips[strip]`, with the color packed for body-part `part`.
+//   strip : 0..7, index into strips[] (= GPIO 2..9 in addLeds order below)
+//   part  : column in frames[][], 1=hat .. 15=board (0 is reserved for time)
+// To add a part: append a row here AND a name in KEYS[] at index `part`.
+struct Section { uint8_t strip, start, count, part; };
+const Section SECTIONS[] = {
+    {0,0,3,7}, {0,3,2,2}, {0,5,1,1},   // strip 0 (GPIO 2): tie, face, hat
+    {1,0,5,3}, {1,5,2,5}, {1,7,5,9},   // strip 1 (GPIO 3): chestL, armL, gloveL
+    {2,0,5,4}, {2,5,2,6}, {2,7,5,10},  // strip 2 (GPIO 4): chestR, armR, gloveR
+    {4,0,2,11},{4,2,1,13},             // strip 4 (GPIO 6): legL, shoeL
+    {5,0,2,12},{5,2,1,14},             // strip 5 (GPIO 7): legR, shoeR
+    {6,0,2,8}, {7,0,1,15},             // strip 6 (GPIO 8): belt | strip 7 (GPIO 9): board
 };
 
+// Per-strip LED buffers. Sizes must match the addLeds<> calls in setup().
+// Resize these (and the matching addLeds<>) when changing physical LED counts.
+CRGB l1[6], l2[12], l3[12], l4[1], l5[3], l6[3], l7[2], l8[1];
+CRGB* strips[] = {l1, l2, l3, l4, l5, l6, l7, l8};
 
-// New Led Sections
-const LEDSection LED_SECTIONS[] = {
-    {0, 0, 3, 7},       // tie
-    {0, 3, 2, 2},       // face
-    {0, 5, 1, 1},       // hat
-    {1, 0, 5, 3},       // chestL
-    {1, 5, 2, 5},       // armL
-    {1, 7, 1, 9},       // gloveL
-    {2, 0, 5, 4},       // chestR
-    {2, 5, 2, 6},       // armR
-    {2, 7, 1, 10},       // gloveR
-    {4, 0, 2, 11},       // legL
-    {4, 2, 1, 13},       // shoeL
-    {5, 0, 2, 12},       // legR
-    {5, 2, 1, 14},       // shoeR
-    {6, 0, 2, 8},       // belt
-    {7, 0, 1, 15},       // board
-};
+// Animation data. frames[i][0] is the start time of frame i in 50ms ticks
+// (so frame i fires at frames[i][0] * 50 ms after playback start).
+// frames[i][1..15] is packed body-part data, with this bit layout:
+//   bits 31..8 : 24-bit RGB color (0xRRGGBB)
+//   bits  7..4 : brightness 0..15 (gamma-2.2 mapped to 0..255 at render)
+//   bit      0 : transition flag (1 = blend linearly into next frame's color)
+uint32_t frames[MAX_FRAMES][16];
+int      numFrames   = 0;
+int      wifiProfile = 0;
+String   deviceId;
 
-// ============================================================================
-// GLOBAL VARIABLES
-// ============================================================================
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
 WiFiUDP udp;
-EasyButton button(BUTTON_PIN, 100, true);
 
-// LED Arrays
-CRGB led1[6], led2[8], led3[8], led4[1], led5[3], led6[3], led7[2], led8[1];
-CRGB* ledArrays[] = {led1, led2, led3, led4, led5, led6, led7, led8};
+enum State { READY, PLAYING };
+State state = READY;
+int           frameIdx   = 0;
+unsigned long startMs    = 0;
+unsigned long lastBeatMs = 0;
 
-// Frame data storage
-unsigned int frameData[MAX_FRAMES][BODY_PARTS + 1];  // +1 for time
+// ---- helpers ----
+// Skips redrawing the OLED if the message hasn't changed -- the I2C refresh
+// is slow (~30ms) and dominates the run loop if called every iteration.
+String lastMsg;
+void msg(const String& s, int sz = 2) {
+    if (s == lastMsg) return;
+    lastMsg = s;
+    Serial.println(s);
+    oled.clearDisplay();
+    oled.setTextSize(sz);
+    oled.setCursor(1, 1);
+    oled.println(s);
+    oled.display();
+}
 
-// System state
-enum State {
-    READY,      // Waiting for commands
-    PLAYING,    // Actively playing back animation
-    STOPPED     // Explicitly stopped
-};
+[[noreturn]] void halt(const String& s) {
+    msg(s);
+    while (1) delay(1000);
+}
 
-State currentState = READY;
-
-// Playback state
-int currentFrameIndex = 0;
-unsigned long playbackStartTime = 0;
-unsigned long lastHeartbeatTime = 0;
-
-// Network state
-int wifiProfile = 0;
-String deviceId;
-
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-void softwareReboot() {
-    // 參數都設 0，就是當機後立即重起
-    Serial.println("Rebooting...");
+[[noreturn]] void reboot() {
     watchdog_reboot(0, 0, 0);
+    while (1);
 }
 
-void showMessage(String message, int textSize = 2) {
-    Serial.println(message);
-    display.clearDisplay();
-    display.setTextSize(textSize);
-    display.setCursor(1, 1);
-    display.println(message);
-    display.display();
-}
+void connectWiFi(int p) {
+    msg("WiFi: " + String(WIFI_SSID[p]), 1);
+    if (p == 1) WiFi.config(IPAddress(192, 168, 1, 100 + PLAYER_NUM));
+    WiFi.begin(WIFI_SSID[p], WIFI_PASS);
 
-int calculateBrightness(unsigned int data) {
-    int brightnessValue = (data >> 4) & 0x0F;  // 0-15
-    return pow(brightnessValue / 15.0, 2.2) * 255;
-}
-
-// ============================================================================
-// WIFI & DATA LOADING
-// ============================================================================
-
-void connectWiFi(int wifiProfile) {
-    showMessage("Connecting\n" + String(WIFI_SSID[wifiProfile]), 1);
-    
-    // Set static IP for profile 1
-    if (wifiProfile == 1) {
-        IPAddress localIP(192, 168, 1, 100 + PLAYER_NUM);
-        WiFi.config(localIP);
-    }
-    
-    Serial.println("Starting WiFi test...");
-    WiFi.begin(WIFI_SSID[wifiProfile], WIFI_PASSWORD);
-    
-    // Wait for connection (max 5 seconds)
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
-        Serial.print("Status: ");
-        Serial.println(WiFi.status());  // Print actual status code
+    for (int i = 0; i < 10 && WiFi.status() != WL_CONNECTED; i++) {
         delay(500);
-        attempts++;
     }
-    
+
     if (WiFi.status() != WL_CONNECTED) {
-        showMessage("WiFi Failed!");
+        msg("WiFi failed");
         delay(2000);
-        softwareReboot();
+        reboot();
     }
-    
-    showMessage("Connected\n" + WiFi.localIP().toString(), 1);
+
+    msg("Connected\n" + WiFi.localIP().toString(), 1);
     delay(1000);
 }
 
-bool downloadChunk(int chunkNumber) {
-    String apiUrl = "https://eesa.dece.nycu.edu.tw/lightdance/api/items/funding/LATEST/player=" + String(PLAYER_NUM) + "/chunk=" + String(chunkNumber);
-    WiFiClientSecure client;
-    client.setInsecure();  // Skip SSL certificate verification
-    Serial.print("Downloading from: ");
-    Serial.println(apiUrl);
+bool downloadChunk(int n) {
+    String url = "https://eesa.dece.nycu.edu.tw/lightdance/api/items/eesa3/LATEST/player="
+                 + String(PLAYER_NUM) + "/chunk=" + String(n);
+
+    WiFiClientSecure c;
+    c.setInsecure();  // server cert not validated
 
     HTTPClient http;
-    http.begin(client, apiUrl);
-    int responseCode = http.GET();
-    
-    // Check for connection/HTTP errors
-    if (responseCode <= 0) {
-        showMessage("HTTP Error: " + String(responseCode), 2);
-        http.end();
-        return false;
-    }
-    
-    // Check for non-success HTTP status
-    if (responseCode != 200) {
-        showMessage("HTTP " + String(responseCode), 2);
-        http.end();
-        return false;
-    }
-    
-    // Parse JSON
-    StaticJsonDocument<4096> doc;
-    DeserializationError jsonError = deserializeJson(doc, http.getString());
-    
-    if (jsonError) {
-        showMessage("JSON Error", 2);
-        http.end();
-        return false;
-    }
-    
-    showMessage("Chunk " + String(chunkNumber), 2);
-    
-    JsonArray players = doc["player_data"];
-    int numFrames = players.size();
+    http.begin(c, url);
 
-    for (int i = 0; i < numFrames && i < CHUNK_SIZE; i++) {
-        int frameIndex = chunkNumber * CHUNK_SIZE + i;
-        frameData[frameIndex][0]  = players[i]["time"].as<unsigned int>();
-        frameData[frameIndex][1]  = players[i]["hat"].as<unsigned int>();
-        frameData[frameIndex][2]  = players[i]["face"].as<unsigned int>();
-        frameData[frameIndex][3]  = players[i]["chestL"].as<unsigned int>();
-        frameData[frameIndex][4]  = players[i]["chestR"].as<unsigned int>();
-        frameData[frameIndex][5]  = players[i]["armL"].as<unsigned int>();
-        frameData[frameIndex][6]  = players[i]["armR"].as<unsigned int>();
-        frameData[frameIndex][7]  = players[i]["tie"].as<unsigned int>();
-        frameData[frameIndex][8]  = players[i]["belt"].as<unsigned int>();
-        frameData[frameIndex][9]  = players[i]["gloveL"].as<unsigned int>();
-        frameData[frameIndex][10] = players[i]["gloveR"].as<unsigned int>();
-        frameData[frameIndex][11] = players[i]["legL"].as<unsigned int>();
-        frameData[frameIndex][12] = players[i]["legR"].as<unsigned int>();
-        frameData[frameIndex][13] = players[i]["shoeL"].as<unsigned int>();
-        frameData[frameIndex][14] = players[i]["shoeR"].as<unsigned int>();
-        frameData[frameIndex][15] = players[i]["board"].as<unsigned int>();
+    if (http.GET() != 200) {
+        http.end();
+        return false;
     }
-    
+
+    StaticJsonDocument<4096> doc;
+    if (deserializeJson(doc, http.getString())) {
+        http.end();
+        return false;
+    }
+
+    // Index in KEYS[] = column in frames[][]. Order matters: the SECTIONS
+    // table's `part` field references these positions directly.
+    static const char* KEYS[] = {
+        "time","hat","face","chestL","chestR","armL","armR","tie",
+        "belt","gloveL","gloveR","legL","legR","shoeL","shoeR","board"
+    };
+
+    JsonArray arr = doc["player_data"];
+    for (int i = 0; i < (int)arr.size() && i < CHUNK_SIZE; i++) {
+        int idx = n * CHUNK_SIZE + i;
+        for (int k = 0; k < 16; k++) {
+            frames[idx][k] = arr[i][KEYS[k]].as<uint32_t>();
+        }
+        numFrames = idx + 1;
+    }
+
     http.end();
-    delay(20);
     return true;
 }
 
-void saveDataToMemory() {
-    File file = LittleFS.open("/data.bin", "w");
-    if (file) {
-        file.write((uint8_t*)frameData, sizeof(frameData));
-        file.close();
-        showMessage("Saved!");
-    }
+// On-flash format: [int numFrames][uint32_t frames[MAX_FRAMES][16]].
+// Bumping MAX_FRAMES, the column count, or moving numFrames invalidates
+// any previously saved /data.bin -- bump a version byte if you care.
+void saveData() {
+    File f = LittleFS.open("/data.bin", "w");
+    if (!f) return;
+    f.write((uint8_t*)&numFrames, sizeof(numFrames));
+    f.write((uint8_t*)frames, sizeof(frames));
+    f.close();
 }
 
-void loadDataFromMemory() {
-    File file = LittleFS.open("/data.bin", "r");
-    if (file) {
-        file.read((uint8_t*)frameData, sizeof(frameData));
-        file.close();
-        showMessage("Loaded!");
-    }
+void loadData() {
+    File f = LittleFS.open("/data.bin", "r");
+    if (!f) return;
+    f.read((uint8_t*)&numFrames, sizeof(numFrames));
+    f.read((uint8_t*)frames, sizeof(frames));
+    f.close();
 }
 
-// ============================================================================
-// LED CONTROL
-// ============================================================================
-
-uint32_t ColorGradient(float startTime, float endTime, uint32_t currentColor, uint32_t nextColor, float currentTime) {
-    float progress = (currentTime - startTime) / (endTime - startTime);
-    if (progress < 0.0f) progress = 0.0f;
-    if (progress > 1.0f) progress = 1.0f;
-
-    CRGB c1(
-        (currentColor >> 16) & 0xFF,
-        (currentColor >> 8)  & 0xFF,
-        currentColor & 0xFF
-    );
-
-    CRGB c2(
-        (nextColor >> 16) & 0xFF,
-        (nextColor >> 8)  & 0xFF,
-        nextColor & 0xFF
-    );
-
-    uint8_t amount = (uint8_t)(progress * 255.0f);
-    CRGB result = blend(c1, c2, amount);
-
-    return ((uint32_t)result.r << 16) |
-           ((uint32_t)result.g << 8)  |
-            (uint32_t)result.b;
+uint8_t brightnessFrom(uint32_t d) {
+    return uint8_t(powf(((d >> 4) & 0x0F) / 15.0f, 2.2f) * 255);
 }
 
-void updateLEDs() {
-  Serial.println("Updating led");
-  Serial.print("Frame: ");
-  Serial.println(currentFrameIndex);
-  // Loop through each body part section and update its LEDs
-  for (const LEDSection& section : LED_SECTIONS) {
-    
-
-    unsigned int bodyPartData = frameData[currentFrameIndex][section.bodyPartIndex];
-    
-    // // Extract flags from last 2 bits
-    // bool shouldTransition = (bodyPartData >> 1) & 0x01;        // Bit 1: transition flag
-    // int transitionDirection = bodyPartData & 0x01;             // Bit 0: direction (0 or 1)
-
-    int shouldTransition = bodyPartData & 0x01; 
-    
-    uint32_t currentColor = bodyPartData >> 8;          // Extract color (upper 24 bits)
-    int brightness = calculateBrightness(bodyPartData); // May need adjustment if brightness uses lower bits
-    
-    uint32_t finalColor = currentColor;
-    
-    // Check if this body part should transition
-    if (shouldTransition && currentFrameIndex + 1 < MAX_FRAMES) {
-      // Get next frame's color
-      unsigned int nextBodyPartData = frameData[currentFrameIndex + 1][section.bodyPartIndex];
-      uint32_t nextColor = nextBodyPartData >> 8;
-      Serial.print("framedata: ");
-      Serial.println(nextBodyPartData);
-      Serial.print("next color: ");
-      Serial.println(nextColor);
-      
-      // Get frame times in milliseconds
-      unsigned long startTime = frameData[currentFrameIndex][0] * 50;
-      unsigned long endTime = frameData[currentFrameIndex + 1][0] * 50;
-      unsigned long currentTime = millis() - playbackStartTime;
-      
-      // Calculate transition color using per-body-part direction
-      finalColor = ColorGradient(startTime, endTime, currentColor, nextColor, currentTime);
-    }
-    // Serial.print("color: ");
-    // Serial.println(finalColor);
-    // Serial.print("brghtness: ");
-    // Serial.println(brightness);
-    // Set all LEDs in this section
-    for (int ledIndex = 0; ledIndex < section.ledCount; ledIndex++) {
-      int position = section.startPosition + ledIndex;
-      ledArrays[section.ledArrayIndex][position] = finalColor;
-      ledArrays[section.ledArrayIndex][position].nscale8(brightness);
-    }
-  }
-  
-  FastLED.show();
+uint32_t blendColor(uint32_t a, uint32_t b, float p) {
+    p = constrain(p, 0.0f, 1.0f);
+    CRGB ca((a >> 16) & 0xFF, (a >> 8) & 0xFF, a & 0xFF);
+    CRGB cb((b >> 16) & 0xFF, (b >> 8) & 0xFF, b & 0xFF);
+    CRGB o = blend(ca, cb, uint8_t(p * 255));
+    return (uint32_t(o.r) << 16) | (uint32_t(o.g) << 8) | o.b;
 }
 
-void clearAllLEDs() {
-    FastLED.clear();
+void renderFrame() {
+    unsigned long t = millis() - startMs;
+    for (auto& s : SECTIONS) {
+        uint32_t cur   = frames[frameIdx][s.part];
+        uint32_t color = cur >> 8;
+        uint8_t  bri   = brightnessFrom(cur);
+        if ((cur & 1) && frameIdx + 1 < numFrames) {
+            uint32_t      nxt = frames[frameIdx + 1][s.part] >> 8;
+            unsigned long t0  = frames[frameIdx][0]     * 50;
+            unsigned long t1  = frames[frameIdx + 1][0] * 50;
+            if (t1 > t0) color = blendColor(color, nxt, float(t - t0) / float(t1 - t0));
+        }
+        for (int i = 0; i < s.count; i++) {
+            CRGB& led = strips[s.strip][s.start + i];
+            led = color;
+            led.nscale8(bri);
+        }
+    }
     FastLED.show();
 }
 
-void runDebugMode() {
-    // Show all body parts in their assigned colors for testing
-    uint32_t bodyPartColors[] = {
-        0x000000,   // 0  - unused
-        0xFF3B30,   // 1  - hat (RED)
-        0xFFD60A,   // 2  - face (YELLOW)
-        0x007AFF,   // 3  - chestL (BLUE)
-        0x5AC8FA,   // 4  - chestR (SKY BLUE)
-        0x34C759,   // 5  - armL (GREEN)
-        0x00E676,   // 6  - armR (NEON GREEN)
-        0xFF9500,   // 7  - tie (ORANGE)
-        0xFFD700,   // 8  - belt (GOLD)
-        0xAF52DE,   // 9  - gloveL (PURPLE)
-        0xFF2D55,   // 10 - gloveR (PINK)
-        0x40E0D0,   // 11 - legL (AQUA)
-        0x00CED1,   // 12 - legR (DARK TURQUOISE)
-        0x8B4513,   // 13 - shoeL (BROWN)
-        0xD2691E,   // 14 - shoeR (CHOCOLATE)
-        0xFFFFFF    // 15 - board (WHITE)
+// DBG[i] is the test color for body-part i (1=hat .. 15=board); index 0
+// is unused. Tweak these to verify wiring -- each body part lights a
+// distinct color so you can spot mismatched strip indexes or counts.
+[[noreturn]] void runDebugMode() {
+    static const uint32_t DBG[] = {
+        0, 0xFF3B30, 0xFFD60A, 0x007AFF, 0x5AC8FA, 0x34C759, 0x00E676, 0xFF9500,
+        0xFFD700, 0xAF52DE, 0xFF2D55, 0x40E0D0, 0x00CED1, 0x8B4513, 0xD2691E, 0xFFFFFF
     };
-    
-    for (const LEDSection& section : LED_SECTIONS) {
-        for (int ledIndex = 0; ledIndex < section.ledCount; ledIndex++) {
-            int position = section.startPosition + ledIndex;
-            ledArrays[section.ledArrayIndex][position] = bodyPartColors[section.bodyPartIndex];
+
+    for (auto& s : SECTIONS) {
+        for (int i = 0; i < s.count; i++) {
+            strips[s.strip][s.start + i] = DBG[s.part];
         }
     }
-    
-    FastLED.setBrightness(255);
-    while (1) {
-        Serial.println("Debugging");
-        FastLED.show();
-        
-        // Print hat color (led1[5])
-        Serial.print("Hat - R: ");
-        Serial.print(led1[5].r);
-        Serial.print(" G: ");
-        Serial.print(led1[5].g);
-        Serial.print(" B: ");
-        Serial.println(led1[5].b);
-        
-        delay(1000);
-    }
+
+    FastLED.show();
+    while (1) delay(1000);
 }
 
-// ============================================================================
-// UDP COMMAND HANDLING
-// ============================================================================
+// Inbound UDP protocol (port UDP_RX_PORT): a single 4-byte big-endian uint32.
+//   == UDP_STOP      -> stop playback, clear LEDs       (returns -1)
+//   == UDP_HEARTBEAT -> just refresh lastBeatMs         (returns -2)
+//   else             -> treat as ms timestamp; (re)sync (returns cmd > 0)
+// Any received packet also resets the heartbeat clock.
+int readUDP() {
+    if (!udp.parsePacket()) return 0;
+    lastBeatMs = millis();
 
-int checkForUDPCommand() {
-    // Serial.print("Listening... ");
-    int packetSize = udp.parsePacket();
-    if (!packetSize) return 0;  // No packet received
-    lastHeartbeatTime = millis();
-    // Debug: Show we received something
-    Serial.print("UDP received from: ");
-    Serial.print(udp.remoteIP());
-    Serial.print(":");
-    Serial.println(udp.remotePort());
-    
-    // Read 4-byte command
-    byte buffer[4];
-    udp.read(buffer, 4);
-    uint32_t command = (buffer[0] << 24) | (buffer[1] << 16) | (buffer[2] << 8) | buffer[3];
-    
-    // Return command type
-    if (command == UDP_STOP_CMD) return -1;        // Stop command
-    if (command == UDP_HEARTBEAT_CMD) return -2;   // Heartbeat
-    return command;  // Timestamp in milliseconds
+    uint8_t b[4];
+    udp.read(b, 4);
+    uint32_t cmd = (uint32_t(b[0]) << 24)
+                 | (uint32_t(b[1]) << 16)
+                 | (uint32_t(b[2]) << 8)
+                 |  uint32_t(b[3]);
+
+    if (cmd == UDP_STOP)      return -1;
+    if (cmd == UDP_HEARTBEAT) return -2;
+    return cmd;
 }
 
-void sendUDPResponse(const char* message) {
-    String response = deviceId + ": " + message;
-
-    Serial.print("Sending response to: ");
-    Serial.print(RESPONSE_ADDRESS[wifiProfile]);
-    Serial.print(":");
-    Serial.println(UDP_TX_PORT);
-    Serial.println(response);
-
-    udp.beginPacket(RESPONSE_ADDRESS[wifiProfile], UDP_TX_PORT);
-    udp.write(response.c_str());
+void respond(const char* m) {
+    String s = deviceId + ": " + m;
+    udp.beginPacket(RESPOND_TO[wifiProfile], UDP_TX_PORT);
+    udp.write(s.c_str());
     udp.endPacket();
 }
 
-void syncPlaybackToTimestamp(int timestamp) {
-    // Just set when playback "started" (in the past)
-    playbackStartTime = millis() - timestamp;
-    
-    Serial.println("Synced to timestamp " + String(timestamp) + " ms");
-    Serial.println("Playback start time " + String(playbackStartTime) + " ms");
-}
-
-// ============================================================================
-// SETUP - Runs once at startup
-// ============================================================================
-
+// ---- setup / loop ----
 void setup() {
-    pinMode(LED_BUILTIN, OUTPUT);
     Serial.begin(115200);
     while (!Serial && millis() < 3000);
-    Serial.println("\n=== LED Controller Starting ===");
-    
-    // Initialize I2C for display
+
     Wire.setSDA(SDA_PIN);
     Wire.setSCL(SCL_PIN);
     Wire.begin();
-    
-    // Initialize display
-    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-        Serial.println("Display initialization failed!");
-    }
-    display.clearDisplay();
-    display.setTextColor(SSD1306_WHITE);
-    display.display();
 
-    showMessage("Starting...");
-    
-    // Setup input pins
-    pinMode(DEBUG_PIN, INPUT_PULLUP);
+    oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+    oled.setTextColor(SSD1306_WHITE);
+    msg("Starting...");
+
+    pinMode(DEBUG_PIN,  INPUT_PULLUP);
     pinMode(SWITCH_PIN, INPUT_PULLUP);
-    pinMode(WIFI_PIN, INPUT_PULLUP);
-    
-    
-    Serial.println(DEBUG_PIN);
-    
-    // Setup button
-    button.begin();
-    button.onPressed([]() {
-        if (currentState == READY || currentState == STOPPED) {
-            currentState = PLAYING;
-            showMessage("Started!");
-        }
-    });
-    
-    // Connect to WiFi (profile selected by WIFI_PIN)
-    wifiProfile = digitalRead(WIFI_PIN) ? 0 : 1;
-    deviceId = "player" + String(PLAYER_NUM);
-    connectWiFi(wifiProfile);
-    
-    // Initialize LED strips        CRGB led1[6], led2[8], led3[8], led4[1], led5[3], led6[3], led7[1], led8[1];
-    FastLED.addLeds<NEOPIXEL, 2>(ledArrays[0], 6);
-    FastLED.addLeds<NEOPIXEL, 3>(ledArrays[1], 8);
-    FastLED.addLeds<NEOPIXEL, 4>(ledArrays[2], 8);
-    FastLED.addLeds<NEOPIXEL, 5>(ledArrays[3], 1);
-    FastLED.addLeds<NEOPIXEL, 6>(ledArrays[4], 3);
-    FastLED.addLeds<NEOPIXEL, 7>(ledArrays[5], 3);
-    FastLED.addLeds<NEOPIXEL, 8>(ledArrays[6], 2);
-    FastLED.addLeds<NEOPIXEL, 9>(ledArrays[7], 1);
-    FastLED.setBrightness(255);
-    clearAllLEDs();
+    pinMode(WIFI_PIN,   INPUT_PULLUP);
 
-    // Serial.println("Testing LEDs directly...");
-    // for(int i = 0; i < 6; i++) {
-    //     led1[i] = CRGB::Red;
-    // }
-    // FastLED.show();
-    // delay(2000);  // Should see red for 2 seconds
-    // Serial.println("Did you see red?");
-    
-    // Initialize filesystem
+    bool debugMode = !digitalRead(DEBUG_PIN);
+
+    // CRITICAL: WiFi MUST init before FastLED. The CYW43 driver and FastLED's
+    // NeoPixel driver both grab PIO state machines (RP2350 has only 8). If
+    // FastLED runs first it can starve CYW43, and WiFi.begin() then fails
+    // silently with no recovery short of a reboot. Do not reorder.
+    if (!debugMode) {
+        wifiProfile = digitalRead(WIFI_PIN) ? 0 : 1;
+        deviceId = "player" + String(PLAYER_NUM);
+        connectWiFi(wifiProfile);
+    }
+
+    // Template arg is the data GPIO (must be a literal). Length must match
+    // the buffer size declared at file scope. Order here = strip index in SECTIONS.
+    FastLED.addLeds<NEOPIXEL, 2>(strips[0], 6);
+    FastLED.addLeds<NEOPIXEL, 3>(strips[1], 8);
+    FastLED.addLeds<NEOPIXEL, 4>(strips[2], 8);
+    FastLED.addLeds<NEOPIXEL, 5>(strips[3], 1);
+    FastLED.addLeds<NEOPIXEL, 6>(strips[4], 3);
+    FastLED.addLeds<NEOPIXEL, 7>(strips[5], 3);
+    FastLED.addLeds<NEOPIXEL, 8>(strips[6], 2);
+    FastLED.addLeds<NEOPIXEL, 9>(strips[7], 1);
+    FastLED.setBrightness(255);
+    FastLED.clear(true);
+
     if (!LittleFS.begin()) {
-        Serial.println("Formatting filesystem...");
         LittleFS.format();
         LittleFS.begin();
     }
 
-    // Check for debug mode
-    if (!digitalRead(DEBUG_PIN)) {
-        showMessage("Debug Mode");
-        Serial.println("Debug Mode");
-        runDebugMode();  // Never returns
+    if (debugMode) {
+        msg("Debug Mode");
+        runDebugMode();
     }
 
-    // if (!initLocalData()) {
-    //     showMessage("FATAL: Data load failed", 5);
-    //     while(1);  // Halt
-    // }
-    
-    // Load animation data - WiFi download ONLY happens here in setup
-    bool useMemoryMode = !digitalRead(SWITCH_PIN);
-    if (useMemoryMode) {
-        showMessage("Loading from\nmemory...");
-        loadDataFromMemory();
+    if (!digitalRead(SWITCH_PIN)) {
+        msg("Loading...");
+        loadData();
     } else {
-        showMessage("Downloading\nfrom WiFi...");
-        
-        bool allSuccess = true;
-        
-        for (int chunk = 0; chunk < NUM_CHUNKS; chunk++) {
-            // Retry each chunk up to 3 times
-            bool chunkSuccess = false;
-            for (int attempt = 0; attempt < 3; attempt++) {
-                if (downloadChunk(chunk)) {
-                    chunkSuccess = true;
-                    break;
-                }
-                showMessage("Retry " + String(attempt + 1) + "/3\nChunk " + String(chunk));
-                delay(500);
+        msg("Downloading...");
+        for (int c = 0; c < NUM_CHUNKS; c++) {
+            bool ok = false;
+            for (int a = 0; a < 3 && !(ok = downloadChunk(c)); a++) {
+                msg("Retry " + String(a + 1) + "/3\nChunk " + String(c));
             }
-            
-            if (!chunkSuccess) {
-                allSuccess = false;
-                showMessage("Failed!\nChunk " + String(chunk));
-                break;  // Stop downloading
-            }
+            if (!ok) halt("Download failed");
+            msg("Chunk " + String(c));
         }
-        
-        if (allSuccess) {
-            showMessage("Download OK!\nSaving...");
-            saveDataToMemory();
-        } else {
-            showMessage("Download failed\nUsing memory...");
-            loadDataFromMemory();  // Fallback to stored data
-        }
+        saveData();
+        halt("Download success");
     }
-    Serial.println("ip: " + WiFi.localIP().toString());
-    // Start UDP listener
+
     udp.begin(UDP_RX_PORT);
     udp.flush();
-    Serial.println("UDP listening on port " + String(UDP_RX_PORT));
-    
-    currentState = READY;
-    showMessage("Ready!\n" + WiFi.localIP().toString());
-    Serial.println("=== Setup Complete ===");
-    Serial.println("State: READY\n");
-    lastHeartbeatTime = millis();
+    lastBeatMs = millis();
+    msg("Ready!\n" + WiFi.localIP().toString(), 1);
 }
 
-// ============================================================================
-// MAIN LOOP - Single unified control flow with state machine
-// ============================================================================
-
+// State machine:
+//   READY   : idle. Reboots if no UDP traffic (any packet) for 5s.
+//   PLAYING : advances frameIdx by elapsed time, renders each loop.
+// Transitions:
+//   any state + UDP_STOP timestamp  -> READY
+//   any state + UDP_HEARTBEAT       -> stays put, just refreshes liveness
+//   any state + timestamp (cmd > 0) -> PLAYING (startMs aligned to host clock)
 void loop() {
-    // Always check button
-    button.read();
-    // Serial.println("loop");
-    digitalWrite(LED_BUILTIN, HIGH);
-    // Check for UDP commands
-    int command = checkForUDPCommand();
-    
-    // Handle stop command
-    if (command == -1) {
-        sendUDPResponse("stopped");
-        currentState = STOPPED;
-        currentFrameIndex = 0;
-        clearAllLEDs();
-    }
-    // Handle heartbeat command
-    else if (command == -2) {
-        sendUDPResponse("heartbeat received");
-    }
-    // Handle timestamp command (starts/syncs playback)
-    else if (command > 0) {
-        sendUDPResponse("running");
-        syncPlaybackToTimestamp(command);
-        currentState = PLAYING;
-    }
-    
-    // Execute behavior based on current state
-    switch (currentState) {
-        case READY:
-            currentFrameIndex = 0;
-            if (millis() - lastHeartbeatTime > 5000) {
-                showMessage("No heartbeat\nRebooting...");
-                delay(500);
-                softwareReboot();
-            }
-            showMessage("Ready!");
-            break;
-            
-        case STOPPED:
-            currentFrameIndex = 0;
-            if (millis() - lastHeartbeatTime > 5000) {
-                showMessage("No heartbeat\nRebooting...");
-                delay(500);
-                softwareReboot();
-            }
-            showMessage("Stopped!");
-            break;
-            
-        case PLAYING:
-            // Check for heartbeat timeout
-            if (millis() - lastHeartbeatTime > HEARTBEAT_TIMEOUT) {
-                showMessage("No Signal!");
-            }
-            else{
-                showMessage("Playing!");
-            }
-            
-            // Calculate current playback time in frames
-            unsigned long elapsedTime = millis() - playbackStartTime;
-            int currentFrame = elapsedTime / 50;  // 50ms per frame
-            Serial.print("currentFrame: ");
-            Serial.println(currentFrame);
-            
+    int cmd = readUDP();
 
-            // Advance to current time position (skip frames if needed)
-            while (currentFrameIndex+1 < MAX_FRAMES && 
-                   frameData[currentFrameIndex+1][0] < currentFrame) {
-                currentFrameIndex++;
-            }
-            Serial.print("currentFrameIndex: ");
-            Serial.println(currentFrameIndex);
-            updateLEDs();
-            break;
+    if (cmd == -1) {
+        respond("stopped");
+        state = READY;
+        frameIdx = 0;
+        FastLED.clear(true);
+    } else if (cmd == -2) {
+        respond("heartbeat received");
+    } else if (cmd > 0) {
+        // Sync trick: pretend playback "started" (millis() - cmd) ago so the
+        // frame index calculation lines up with the host's elapsed ms.
+        respond("running");
+        startMs = millis() - cmd;
+        state = PLAYING;
     }
-    
+
+    if (state == READY) {
+        if (millis() - lastBeatMs > 5000) {
+            msg("No heartbeat\nReboot");
+            delay(500);
+            reboot();
+        }
+        msg("Ready!");
+    } else {
+        msg(millis() - lastBeatMs > HEARTBEAT_MS ? "No Signal!" : "Playing!");
+
+        // current playback time in 50ms ticks
+        int cur = (millis() - startMs) / 50;
+
+        // Advance to the latest frame whose start tick is <= cur. Linear is
+        // fine for sequential playback; swap to binary search if you ever
+        // seek to arbitrary timestamps.
+        while (frameIdx + 1 < numFrames && frames[frameIdx + 1][0] < (uint32_t)cur) {
+            frameIdx++;
+        }
+
+        renderFrame();
+    }
+
     delay(5);
 }
-
