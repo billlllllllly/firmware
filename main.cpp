@@ -30,7 +30,7 @@
 // ---- config ----
 // PLAYER_NUM identifies this unit; flash a unique value per costume.
 // All input pins use INPUT_PULLUP, so "low" = switch closed to GND.
-#define PLAYER_NUM     0
+#define PLAYER_NUM     1
 #define SDA_PIN        12
 #define SCL_PIN        13
 #define DEBUG_PIN      18  // low = debug mode (offline test colors)  | high = normal boot
