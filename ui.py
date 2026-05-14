@@ -27,7 +27,7 @@ PART_NAMES = ["hat", "face", "chestL", "chestR", "armL", "armR", "tie",
               "belt", "gloveL", "gloveR", "legL", "legR", "shoeL", "shoeR",
               "board"]
 
-# PLAYER_NUM values in main_props.cpp; index N here -> dancer N+1.
+# UI labels for the prop boards. Firmware PLAYER_NUM 2/3/4/6 displays as 3/4/5/7.
 PROP_PLAYERS = [3, 4, 5, 7]
 
 
@@ -378,7 +378,7 @@ class MonitorWindow(QMainWindow):
                     continue
                 pidx = parse_prop_index(device.device_id)
                 if pidx is not None:
-                    online_props.add(pidx)
+                    online_props.add(pidx + 1)
 
         if self.dancers and self.players is not None:
             ticks = self.time_provider()
