@@ -40,7 +40,7 @@
 #include "hardware/watchdog.h"
 
 // ---- config ----
-#define PLAYER_NUM     3  // selects which SECTIONS table below applies
+#define PLAYER_NUM     4  // selects which SECTIONS table below applies
 #define PROP1_PIN      2
 #define PROP2_PIN      3
 #define PROP3_PIN      4
@@ -73,26 +73,34 @@ const char* RESPOND_TO[] = {"192.168.0.137", "192.168.1.10"};
 // STRIP_LENS[i] is the LED count for strip i (must cover every section's range).
 struct Section { uint8_t strip, start, count, slot; };
 
-#if PLAYER_NUM == 2 || PLAYER_NUM == 3
-//  (acc0..1), on strip 0, 1.
-const Section SECTIONS[] = {
-    {0, 0, 2, 0}, {1, 0, 3, 1},
-};
-const uint8_t STRIP_LENS[3] = {2, 3, 0};
 
-#elif PLAYER_NUM == 4
-// Dancer 3: 2 props on rope (acc0..1), all on strip 0.
+// knife 1
+#if PLAYER_NUM == 4
 const Section SECTIONS[] = {
-    {0, 0, 5, 0}, {1, 0, 5, 1},
+    {0, 0, 1, 0}, {0, 4, 1, 0}, {0, 1, 1, 1}, {0, 2, 2, 2},
 };
-const uint8_t STRIP_LENS[3] = {5, 5, 0};
+const uint8_t STRIP_LENS[3] = {5, 0, 0};
 
-#elif PLAYER_NUM == 5
-// Dancer 3: 2 props on rope (acc0..1), all on strip 0.
+// knife 2
+#elif PLAYER_NUM == 6
 const Section SECTIONS[] = {
-    {0, 0, 2, 0}, {1, 0, 5, 1}, {2, 0, 5, 2},
+    {0, 2, 2, 2}, {0, 4, 1, 1}, {1, 0, 2, 0},
 };
-const uint8_t STRIP_LENS[3] = {2, 5, 5};
+const uint8_t STRIP_LENS[3] = {5, 3, 0};
+
+// big sword
+#elif PLAYER_NUM == 3
+const Section SECTIONS[] = {
+    {0, 0, 3, 0}, {1, 0, 3, 2}, {2, 0, 1, 1}
+};
+const uint8_t STRIP_LENS[3] = {3, 3, 2};
+
+// umbrella
+#elif PLAYER_NUM == 2
+const Section SECTIONS[] = {
+    {0, 0, 4, 0}, {1, 0, 4, 0}, {2, 0, 2, 1},
+};
+const uint8_t STRIP_LENS[3] = {4, 4, 2};
 
 #else
 #error "Define a SECTIONS table for this PLAYER_NUM in main_props.cpp."
@@ -252,18 +260,15 @@ void renderFrame() {
     FastLED.show();
 }
 
-// DBG[i] is the test color for acc slot i (0..7). Tweak these to verify
-// wiring -- each slot lights a distinct color so you can spot mismatched
-// strip indexes or counts in SECTIONS.
+// Fill every LED on every configured strip with DBG_COLOR. Uses STRIP_LENS so
+// it covers the full chain for this player, not just the LEDs referenced by
+// SECTIONS -- handy for catching dead pixels past the last mapped section.
 [[noreturn]] void runDebugMode() {
-    static const uint32_t DBG[NUM_ACC] = {
-        0xFF3B30, 0xFFD60A, 0x007AFF, 0x5AC8FA,
-        0x34C759, 0xFF9500, 0xAF52DE, 0xFFFFFF
-    };
+    static const uint32_t DBG_COLOR = 0xFFFFFF;
 
-    for (auto& s : SECTIONS) {
-        for (int i = 0; i < s.count; i++) {
-            strips[s.strip][s.start + i] = DBG[s.slot];
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < STRIP_LENS[s]; i++) {
+            strips[s][i] = DBG_COLOR;
         }
     }
 
