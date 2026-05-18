@@ -365,6 +365,14 @@ class MonitorWindow(QMainWindow):
                     v = max(0, minutes * 60 + seconds)
                 else:
                     v = 0
+            elif ";" in text:
+                parts = text.split(";", 1)
+                if len(parts) == 2:
+                    minutes = int(parts[0]) if parts[0] else 0
+                    seconds = int(parts[1]) if parts[1] else 0
+                    v = max(0, minutes * 60 + seconds)
+                else:
+                    v = 0
             else:
                 v = max(0, int(float(text)))
             self.time_input.setText(str(v))
