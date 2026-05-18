@@ -339,6 +339,13 @@ class MonitorWindow(QMainWindow):
                     minutes = float(parts[0]) if parts[0] else 0
                     seconds = float(parts[1]) if parts[1] else 0
                     return (minutes * 60) + seconds
+            elif ";" in time_str_raw:
+                # if format MM:SS return MM*60 + SS
+                parts = time_str_raw.split(";")
+                if len(parts) == 2:
+                    minutes = float(parts[0]) if parts[0] else 0
+                    seconds = float(parts[1]) if parts[1] else 0
+                    return (minutes * 60) + seconds
             return int(float(time_str_raw))
         except ValueError:
             return 0
