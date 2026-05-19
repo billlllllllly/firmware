@@ -30,7 +30,7 @@
 // ---- config ----
 // PLAYER_NUM identifies this unit; flash a unique value per costume.
 // All input pins use INPUT_PULLUP, so "low" = switch closed to GND.
-#define PLAYER_NUM     1
+#define PLAYER_NUM     2
 #define SDA_PIN        12
 #define SCL_PIN        13
 #define DEBUG_PIN      18  // low = debug mode (offline test colors)  | high = normal boot
@@ -209,13 +209,20 @@ void renderFrame() {
     for (auto& s : SECTIONS) {
         uint32_t cur   = frames[frameIdx][s.part];
         uint32_t color = cur >> 8;
-        uint8_t  bri   = brightnessFrom(cur);
+        float    nib   = float((cur >> 4) & 0x0F);
         if ((cur & 1) && frameIdx + 1 < numFrames) {
-            uint32_t      nxt = frames[frameIdx + 1][s.part] >> 8;
-            unsigned long t0  = frames[frameIdx][0]     * 50;
-            unsigned long t1  = frames[frameIdx + 1][0] * 50;
-            if (t1 > t0) color = blendColor(color, nxt, float(t - t0) / float(t1 - t0));
+            uint32_t      nxtRaw = frames[frameIdx + 1][s.part];
+            uint32_t      nxt    = nxtRaw >> 8;
+            float         nnib   = float((nxtRaw >> 4) & 0x0F);
+            unsigned long t0     = frames[frameIdx][0]     * 50;
+            unsigned long t1     = frames[frameIdx + 1][0] * 50;
+            if (t1 > t0) {
+                float p = constrain(float(t - t0) / float(t1 - t0), 0.0f, 1.0f);
+                color = blendColor(color, nxt, p);
+                nib   = nib + (nnib - nib) * p;
+            }
         }
+        uint8_t bri = uint8_t(powf(nib / 15.0f, 2.2f) * 255);
         for (int i = 0; i < s.count; i++) {
             CRGB& led = strips[s.strip][s.start + i];
             led = color;
