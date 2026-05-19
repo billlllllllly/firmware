@@ -40,7 +40,7 @@
 #include "hardware/watchdog.h"
 
 // ---- config ----
-#define PLAYER_NUM     3  // selects which SECTIONS table below applies
+#define PLAYER_NUM     4  // selects which SECTIONS table below applies
 #define PROP1_PIN      2
 #define PROP2_PIN      3
 #define PROP3_PIN      4
@@ -77,14 +77,14 @@ struct Section { uint8_t strip, start, count, slot; };
 // knife 1
 #if PLAYER_NUM == 4
 const Section SECTIONS[] = {
-    {0, 0, 1, 0}, {0, 4, 1, 0}, {0, 1, 1, 1}, {0, 2, 2, 2},
+    {0, 0, 1, 0}, {0, 4, 1, 0}, {0, 1, 1, 2}, {0, 2, 2, 4},
 };
 const uint8_t STRIP_LENS[3] = {5, 0, 0};
 
 // knife 2
 #elif PLAYER_NUM == 6
 const Section SECTIONS[] = {
-    {0, 2, 2, 2}, {0, 4, 1, 1}, {1, 0, 2, 0},
+    {0, 2, 2, 4}, {0, 4, 1, 2}, {1, 0, 2, 0},
 };
 const uint8_t STRIP_LENS[3] = {5, 3, 0};
 
@@ -433,8 +433,7 @@ void loop() {
         while (frameIdx + 1 < numFrames && frames[frameIdx + 1][0] < (uint32_t)cur) {
             frameIdx++;
         }
-        // breathing green: ~2s period via 8-bit sine LUT
-        ind[0] = CRGB(0, sin8((millis() >> 3) & 0xFF), 0);
+        ind[0] = CRGB::Black;
         renderFrame();
     }
 
