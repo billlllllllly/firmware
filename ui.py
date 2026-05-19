@@ -256,6 +256,29 @@ class MonitorWindow(QMainWindow):
 
         cl.addStretch()
 
+        # music offset (seconds): +ve = music ahead of broadcast
+        self.offset_input = QLineEdit(f"{self.controller.music_offset:g}")
+        self.offset_input.setFixedWidth(70)
+        self.offset_input.setMinimumHeight(44)
+        self.offset_input.setAlignment(Qt.AlignCenter)
+        self.offset_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {SURFACE};
+                border: none; border-radius: 8px;
+                padding: 8px 14px;
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 14px; color: {TEXT};
+            }}
+        """)
+        self.offset_input.editingFinished.connect(self._on_offset_changed)
+        cl.addWidget(self.offset_input)
+
+        offset_label = QLabel("offset")
+        offset_label.setStyleSheet(f"font-size: 13px; color: {TEXT};")
+        cl.addWidget(offset_label)
+
+        cl.addSpacing(30)
+
         self.time_input = QLineEdit("0")
         self.time_input.setFixedWidth(100)
         self.time_input.setMinimumHeight(44)
@@ -363,6 +386,14 @@ class MonitorWindow(QMainWindow):
             self.time_input.setText(str(v))
         except ValueError:
             self.time_input.setText("0")
+
+    def _on_offset_changed(self):
+        try:
+            v = float(self.offset_input.text().strip())
+        except ValueError:
+            v = self.controller.music_offset
+        self.offset_input.setText(f"{v:g}")
+        self.controller.set_music_offset(v)
 
     def _toggle_playback(self):
         if self.controller.isRunning:
