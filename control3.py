@@ -135,6 +135,8 @@ class MusicPlayer(QObject):
         self.startTime = 0
         self._want_play = False
         self._fired_started = False
+        self._warmed = False     # pipeline primed via a silent play/pause cycle
+        self._prewarming = False  # True while the silent prewarm is in flight
         self.player.mediaStatusChanged.connect(self._on_status_changed)
         self.player.playbackStateChanged.connect(self._on_playback_state)
         self.player.setSource(QUrl.fromLocalFile(file_path))
@@ -149,10 +151,20 @@ class MusicPlayer(QObject):
             print(f"🔊 Audio output: {device.description()}")
 
     def play_music(self):
-        # Re-check in case the default changed while idle.
-        self._sync_output_device()
+        # Note: the output device is kept current via audioOutputsChanged,
+        # so we don't re-query it here — that work would add latency right
+        # at the click and delay the moment audio starts.
         self._want_play = True
         self._fired_started = False
+        if self._prewarming:
+            # Start was pressed before the silent prewarm finished — co-opt
+            # the already-running pipeline: unmute, seek, and report started.
+            self._prewarming = False
+            self.audio_output.setVolume(self._saved_volume)
+            self._seek_and_play()
+            self._fired_started = True
+            self.started.emit()
+            return
         status = self.player.mediaStatus()
         if status in (QMediaPlayer.MediaStatus.LoadedMedia,
                       QMediaPlayer.MediaStatus.BufferedMedia,
@@ -167,19 +179,44 @@ class MusicPlayer(QObject):
         self.startTime = t
 
     def _seek_and_play(self):
-        self.player.setPosition(max(0, int(self.startTime * 1000)))
+        target_ms = max(0, int(self.startTime * 1000))
+        # Skip a no-op seek: on a freshly loaded MP3 even setPosition(0)
+        # forces the backend to re-buffer, which delays playback.
+        if target_ms or self.player.position():
+            self.player.setPosition(target_ms)
+        self.player.play()
+
+    def _prewarm(self):
+        """Prime the Media Foundation pipeline once so the first real Start
+        doesn't pay the device/decoder spin-up cost. Plays silently, then
+        pauses back at the beginning as soon as playback truly begins."""
+        self._warmed = True  # mark first so the play() below isn't re-warmed
+        self._prewarming = True
+        self._saved_volume = self.audio_output.volume()
+        self.audio_output.setVolume(0.0)
         self.player.play()
 
     def _on_status_changed(self, status):
-        if (status == QMediaPlayer.MediaStatus.LoadedMedia
-                and self._want_play
-                and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState):
+        if status != QMediaPlayer.MediaStatus.LoadedMedia:
+            return
+        if (self._want_play
+                and self.player.playbackState()
+                != QMediaPlayer.PlaybackState.PlayingState):
             self._seek_and_play()
+        elif not self._warmed and not self._want_play:
+            self._prewarm()
 
     def _on_playback_state(self, state):
-        if (state == QMediaPlayer.PlaybackState.PlayingState
-                and self._want_play
-                and not self._fired_started):
+        if state != QMediaPlayer.PlaybackState.PlayingState:
+            return
+        if self._prewarming and not self._want_play:
+            # End of the prewarm cycle: stop the silent playback and
+            # restore volume so the next real Start is instant.
+            self._prewarming = False
+            self.player.pause()
+            self.player.setPosition(0)
+            self.audio_output.setVolume(self._saved_volume)
+        elif not self._fired_started:
             self._fired_started = True
             self.started.emit()
 
