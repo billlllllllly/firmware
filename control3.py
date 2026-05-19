@@ -34,10 +34,6 @@ RESPONSE_PORT = 12346  # we listen here
 # Column N+1 of a frame row is part N's color word (column 0 is the timestamp).
 PART_COL = {name: i + 1 for i, name in enumerate(PART_NAMES)}
 
-# 4-bit brightness -> 0..255 with gamma 2.2 (matches firmware brightnessFrom).
-_BRI_LUT = np.array(
-    [int((b / 15.0) ** 2.2 * 255 + 0.5) for b in range(16)], dtype=np.uint8)
-
 
 # ============================================================
 # LIGHT DATA — per-player frame timeline + color decoder
@@ -78,15 +74,18 @@ class PlayerData:
             r = (cur >> 24) & 0xFF
             g = (cur >> 16) & 0xFF
             b = (cur >> 8) & 0xFF
-            bri = int(_BRI_LUT[(cur >> 4) & 0x0F])
+            nib = float((cur >> 4) & 0x0F)
             if (cur & 1) and next_idx is not None:
                 nxt = int(self.frames[next_idx, PART_COL[name]])
                 nr = (nxt >> 24) & 0xFF
                 ng = (nxt >> 16) & 0xFF
                 nb = (nxt >> 8) & 0xFF
+                nnib = float((nxt >> 4) & 0x0F)
                 r = int(r * (1 - blend) + nr * blend)
                 g = int(g * (1 - blend) + ng * blend)
                 b = int(b * (1 - blend) + nb * blend)
+                nib = nib * (1 - blend) + nnib * blend
+            bri = int((nib / 15.0) ** 2.2 * 255 + 0.5)
             result[name] = ((r * bri) // 255,
                             (g * bri) // 255,
                             (b * bri) // 255)
