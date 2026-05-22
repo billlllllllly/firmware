@@ -7,7 +7,8 @@ Exports:
 import re
 import time as time_module
 
-from PySide6.QtCore import QPointF, Qt, QTimer
+# 新增了 QEvent 匯入
+from PySide6.QtCore import QEvent, QPointF, Qt, QTimer
 from PySide6.QtGui import (QBrush, QColor, QFont, QPainter, QPainterPath,
                             QPolygonF)
 from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -139,6 +140,8 @@ class DancerWidget(QWidget):
         p.drawPolygon(QPolygonF([QPointF(105, 153),
                                   QPointF(137, 153),
                                   QPointF(121, 173)]))
+                                  
+        p.end()
 
 
 # ============================================================
@@ -173,6 +176,8 @@ class PropWidget(QWidget):
         p.drawText(28, 0, self.width() - 32, self.height(),
                    Qt.AlignVCenter | Qt.AlignLeft,
                    f"Prop p{self.player_num}")
+                   
+        p.end()
 
 
 # ============================================================
@@ -185,7 +190,7 @@ class MonitorWindow(QMainWindow):
         self.players = players
         self.time_provider = time_provider
         self.dancers = []
-        self.props = {}  # player_num -> PropWidget
+        self.props = {}
 
         self._init_ui()
         self._setup_timers()
@@ -206,7 +211,7 @@ class MonitorWindow(QMainWindow):
         root.setSpacing(16)
         root.addSpacing(40)
 
-        # dancer grid (or fallback message if no light data)
+        # dancer grid
         n = len(self.players) if self.players is not None else 0
         if n == 0:
             warn = QLabel("lightdata.npz not found.\n"
@@ -227,7 +232,7 @@ class MonitorWindow(QMainWindow):
                 grid.addWidget(w, i // cols, i % cols)
             root.addWidget(grid_host, stretch=1)
 
-        # prop status row, one indicator per known prop player
+        # prop status row
         prop_host = QWidget()
         prop_row = QHBoxLayout(prop_host)
         prop_row.setContentsMargins(0, 0, 0, 0)
@@ -242,7 +247,7 @@ class MonitorWindow(QMainWindow):
 
         root.addSpacing(40)
 
-        # bottom controls: [broadcast] ... [input] seconds [Start] [Exit]
+        # bottom controls
         controls = QWidget()
         cl = QHBoxLayout(controls)
         cl.setContentsMargins(0, 0, 0, 0)
@@ -256,7 +261,6 @@ class MonitorWindow(QMainWindow):
 
         cl.addStretch()
 
-        # music offset (seconds): +ve = music ahead of broadcast
         self.offset_input = QLineEdit(f"{self.controller.music_offset:g}")
         self.offset_input.setFixedWidth(70)
         self.offset_input.setMinimumHeight(44)
@@ -271,6 +275,7 @@ class MonitorWindow(QMainWindow):
             }}
         """)
         self.offset_input.editingFinished.connect(self._on_offset_changed)
+        self.offset_input.installEventFilter(self)  # <--- 加入事件攔截器
         cl.addWidget(self.offset_input)
 
         offset_label = QLabel("offset")
@@ -293,6 +298,7 @@ class MonitorWindow(QMainWindow):
             }}
         """)
         self.time_input.editingFinished.connect(self._on_input_changed)
+        self.time_input.installEventFilter(self)  # <--- 加入事件攔截器
         cl.addWidget(self.time_input)
 
         sec_label = QLabel("seconds")
@@ -356,7 +362,6 @@ class MonitorWindow(QMainWindow):
         try:
             time_str_raw = self.time_input.text().strip()
             if ":" in time_str_raw:
-                # if format MM:SS return MM*60 + SS
                 parts = time_str_raw.split(":")
                 if len(parts) == 2:
                     minutes = float(parts[0]) if parts[0] else 0
@@ -437,3 +442,28 @@ class MonitorWindow(QMainWindow):
 
         for pn, w in self.props.items():
             w.set_online(pn in online_props)
+
+    # ---- 事件攔截器 (Event Filter) ----
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_Space:
+                self._toggle_playback()
+                return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        focused_widget = self.focusWidget()
+
+        if isinstance(focused_widget, QLineEdit):
+            super().keyPressEvent(event)
+            return
+
+        if event.key() == Qt.Key_Backspace:
+            self.time_input.setFocus()
+            self.time_input.selectAll()
+            
+        elif event.key() == Qt.Key_Space:
+            self._toggle_playback()
+            
+        else:
+            super().keyPressEvent(event)
