@@ -24,6 +24,7 @@ from ui import MonitorWindow, PART_NAMES
 # ============================================================
 MUSIC_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "2026_show.mp3")
+
 MUSIC_OFFSET = 0.2  # +ve = music ahead of broadcast, -ve = behind
 
 LIGHTDATA_FILE = os.path.join(
@@ -279,6 +280,7 @@ class Controller:
         self.isRunning = False
         self.rootTime = 0   # ms timestamp when broadcast clock started
         self.startTime = 0  # seconds offset configured by user
+        self.music_file = MUSIC_FILE
         self.music_offset = MUSIC_OFFSET
         self.count = 0
 

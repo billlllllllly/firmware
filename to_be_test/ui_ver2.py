@@ -4,15 +4,23 @@ Exports:
     MonitorWindow  - main window; expects (controller, players, time_provider)
     PART_NAMES     - body part order, shared with the controller
 """
+import os
 import re
 import time as time_module
 
-# 新增了 QEvent 匯入
-from PySide6.QtCore import QEvent, QPointF, Qt, QTimer
+import numpy as np
+
+from PySide6.QtCore import QPointF, Qt, QTimer, QUrl
 from PySide6.QtGui import (QBrush, QColor, QFont, QPainter, QPainterPath,
-                            QPolygonF)
+                            QPen, QPolygonF)
 from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                 QMainWindow, QPushButton, QVBoxLayout, QWidget)
+
+try:
+    from PySide6.QtMultimedia import QAudioDecoder, QAudioFormat
+except Exception:  # Keep the UI usable even if QtMultimedia decoding is missing.
+    QAudioDecoder = None
+    QAudioFormat = None
 
 # ---- theme ----
 BG       = "#111113"
@@ -140,8 +148,6 @@ class DancerWidget(QWidget):
         p.drawPolygon(QPolygonF([QPointF(105, 153),
                                   QPointF(137, 153),
                                   QPointF(121, 173)]))
-                                  
-        p.end()
 
 
 # ============================================================
@@ -176,9 +182,256 @@ class PropWidget(QWidget):
         p.drawText(28, 0, self.width() - 32, self.height(),
                    Qt.AlignVCenter | Qt.AlignLeft,
                    f"Prop p{self.player_num}")
-                   
-        p.end()
 
+
+
+# ============================================================
+# MP3 WAVEFORM WIDGET — bottom-right future audio preview
+# ============================================================
+class WaveformWidget(QWidget):
+    """Shows the upcoming MP3 waveform using the same playback clock as the show.
+
+    The decoder runs once at startup and stores a compact peak envelope instead
+    of the full PCM stream, so repainting the preview is lightweight.
+    """
+    def __init__(self, time_provider_seconds, future_seconds=12.0):
+        super().__init__()
+        self.time_provider_seconds = time_provider_seconds
+        self.future_seconds = float(future_seconds)
+        self.waveform = np.zeros(0, dtype=np.float32)
+        self.sample_rate = 44100
+        self.frames_per_bin = 1024
+        self.duration_seconds = 0.0
+        self.status_text = "No MP3"
+        self._decoder = None
+        self._pending_abs = np.zeros(0, dtype=np.float32)
+        self.setMinimumSize(360, 76)
+        self.setMaximumHeight(90)
+
+    def load_file(self, file_path):
+        if not file_path:
+            self.status_text = "No MP3 path"
+            self.update()
+            return
+        if not os.path.exists(file_path):
+            self.status_text = "MP3 not found"
+            self.update()
+            return
+        if QAudioDecoder is None or QAudioFormat is None:
+            self.status_text = "QAudioDecoder unavailable"
+            self.update()
+            return
+
+        self.status_text = "Loading waveform..."
+        self.waveform = np.zeros(0, dtype=np.float32)
+        self._pending_abs = np.zeros(0, dtype=np.float32)
+        self.duration_seconds = 0.0
+
+        self._decoder = QAudioDecoder(self)
+        self._decoder.bufferReady.connect(self._on_audio_buffer_ready)
+        self._decoder.finished.connect(self._on_decode_finished)
+        self._decoder.durationChanged.connect(self._on_duration_changed)
+        try:
+            self._decoder.error.connect(self._on_decoder_error)
+        except Exception:
+            pass
+        self._decoder.setSource(QUrl.fromLocalFile(file_path))
+        self._decoder.start()
+        self.update()
+
+    def set_future_seconds(self, seconds):
+        self.future_seconds = max(1.0, float(seconds))
+        self.update()
+
+    def _on_duration_changed(self, duration_ms):
+        if duration_ms and duration_ms > 0:
+            self.duration_seconds = duration_ms / 1000.0
+            self.update()
+
+    def _on_decoder_error(self, *_args):
+        msg = self._decoder.errorString() if self._decoder else "Decode error"
+        self.status_text = msg or "Decode error"
+        self.update()
+
+    def _on_audio_buffer_ready(self):
+        if self._decoder is None:
+            return
+        buf = self._decoder.read()
+        samples = self._buffer_to_mono_float(buf)
+        if samples.size == 0:
+            return
+
+        fmt = buf.format()
+        sr = fmt.sampleRate()
+        if sr > 0:
+            self.sample_rate = sr
+
+        abs_samples = np.abs(samples).astype(np.float32, copy=False)
+        if self._pending_abs.size:
+            abs_samples = np.concatenate((self._pending_abs, abs_samples))
+            self._pending_abs = np.zeros(0, dtype=np.float32)
+
+        usable = (abs_samples.size // self.frames_per_bin) * self.frames_per_bin
+        if usable <= 0:
+            self._pending_abs = abs_samples
+            return
+
+        bins = abs_samples[:usable].reshape(-1, self.frames_per_bin).max(axis=1)
+        if self.waveform.size:
+            self.waveform = np.concatenate((self.waveform, bins))
+        else:
+            self.waveform = bins
+        self._pending_abs = abs_samples[usable:]
+        self.duration_seconds = max(
+            self.duration_seconds,
+            self.waveform.size * self.frames_per_bin / max(1, self.sample_rate),
+        )
+        self.update()
+
+    def _on_decode_finished(self):
+        if self._pending_abs.size:
+            self.waveform = np.concatenate((
+                self.waveform,
+                np.array([float(self._pending_abs.max())], dtype=np.float32),
+            ))
+            self._pending_abs = np.zeros(0, dtype=np.float32)
+        if self.waveform.size:
+            peak = float(self.waveform.max())
+            if peak > 0:
+                self.waveform = np.clip(self.waveform / peak, 0.0, 1.0)
+            self.status_text = ""
+            self.duration_seconds = max(
+                self.duration_seconds,
+                self.waveform.size * self.frames_per_bin / max(1, self.sample_rate),
+            )
+        else:
+            self.status_text = "No waveform data"
+        self.update()
+
+    def _buffer_to_mono_float(self, buf):
+        if not buf.isValid():
+            return np.zeros(0, dtype=np.float32)
+
+        raw = self._buffer_bytes(buf)
+        if not raw:
+            return np.zeros(0, dtype=np.float32)
+
+        fmt = buf.format()
+        channel_count = max(1, fmt.channelCount())
+        sample_format = fmt.sampleFormat()
+
+        try:
+            if sample_format == QAudioFormat.SampleFormat.UInt8:
+                data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+                data = (data - 128.0) / 128.0
+            elif sample_format == QAudioFormat.SampleFormat.Int16:
+                data = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                data /= 32768.0
+            elif sample_format == QAudioFormat.SampleFormat.Int32:
+                data = np.frombuffer(raw, dtype=np.int32).astype(np.float32)
+                data /= 2147483648.0
+            elif sample_format == QAudioFormat.SampleFormat.Float:
+                data = np.frombuffer(raw, dtype=np.float32).astype(np.float32)
+            else:
+                return np.zeros(0, dtype=np.float32)
+        except ValueError:
+            return np.zeros(0, dtype=np.float32)
+
+        frame_count = data.size // channel_count
+        if frame_count <= 0:
+            return np.zeros(0, dtype=np.float32)
+        data = data[:frame_count * channel_count].reshape(frame_count,
+                                                           channel_count)
+        return data.mean(axis=1).astype(np.float32, copy=False)
+
+    def _buffer_bytes(self, buf):
+        byte_count = buf.byteCount()
+        for getter_name in ("constData", "data"):
+            getter = getattr(buf, getter_name, None)
+            if getter is None:
+                continue
+            try:
+                data = getter()
+                if isinstance(data, memoryview):
+                    return data.tobytes()[:byte_count]
+                return bytes(data)[:byte_count]
+            except Exception:
+                continue
+        return b""
+
+    def _format_time(self, seconds):
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(SURFACE))
+
+        margin = 10
+        label_h = 18
+        graph_top = margin + label_h + 4
+        graph_bottom = self.height() - margin
+        graph_h = max(1, graph_bottom - graph_top)
+        graph_w = max(1, self.width() - 2 * margin)
+
+        now_s = max(0.0, float(self.time_provider_seconds()))
+        end_s = now_s + self.future_seconds
+
+        p.setPen(QColor(TEXT))
+        f = QFont()
+        f.setPointSize(8)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(margin, 4, graph_w, label_h, Qt.AlignLeft | Qt.AlignVCenter,
+                   "MP3 future signal")
+
+        p.setPen(QColor(DIM))
+        f.setBold(False)
+        p.setFont(f)
+        label = f"{self._format_time(now_s)} → {self._format_time(end_s)}"
+        p.drawText(margin, 4, graph_w, label_h, Qt.AlignRight | Qt.AlignVCenter,
+                   label)
+
+        mid_y = graph_top + graph_h / 2
+        p.setPen(QPen(QColor("#2a2a31"), 1))
+        p.drawLine(margin, int(mid_y), margin + graph_w, int(mid_y))
+
+        if self.waveform.size == 0:
+            p.setPen(QColor(DIM if self.status_text else TEXT))
+            p.drawText(margin, graph_top, graph_w, graph_h,
+                       Qt.AlignCenter, self.status_text or "Loading...")
+            return
+
+        bin_seconds = self.frames_per_bin / max(1, self.sample_rate)
+        start_bin = int(now_s / bin_seconds)
+        end_bin = int(end_s / bin_seconds) + 1
+        if start_bin >= self.waveform.size:
+            p.setPen(QColor(DIM))
+            p.drawText(margin, graph_top, graph_w, graph_h,
+                       Qt.AlignCenter, "End of track")
+            return
+
+        segment = self.waveform[start_bin:min(end_bin, self.waveform.size)]
+        if segment.size == 0:
+            return
+
+        points = min(graph_w, segment.size)
+        if points <= 1:
+            return
+
+        # Resample the visible future window to one vertical bar per pixel.
+        xp = np.linspace(0, segment.size - 1, int(points))
+        amps = np.interp(xp, np.arange(segment.size), segment)
+        p.setPen(QPen(QColor(ACCENT), 1))
+        for x_i, amp in enumerate(amps):
+            x = margin + x_i
+            half_h = float(amp) * (graph_h * 0.46)
+            p.drawLine(x, int(mid_y - half_h), x, int(mid_y + half_h))
+
+        # Left edge is the current playback point; everything right of it is future audio.
+        p.setPen(QPen(QColor(TEXT), 1))
+        p.drawLine(margin, graph_top, margin, graph_bottom)
 
 # ============================================================
 # MAIN WINDOW
@@ -190,7 +443,7 @@ class MonitorWindow(QMainWindow):
         self.players = players
         self.time_provider = time_provider
         self.dancers = []
-        self.props = {}
+        self.props = {}  # player_num -> PropWidget
 
         self._init_ui()
         self._setup_timers()
@@ -211,7 +464,7 @@ class MonitorWindow(QMainWindow):
         root.setSpacing(16)
         root.addSpacing(40)
 
-        # dancer grid
+        # dancer grid (or fallback message if no light data)
         n = len(self.players) if self.players is not None else 0
         if n == 0:
             warn = QLabel("lightdata.npz not found.\n"
@@ -232,7 +485,7 @@ class MonitorWindow(QMainWindow):
                 grid.addWidget(w, i // cols, i % cols)
             root.addWidget(grid_host, stretch=1)
 
-        # prop status row
+        # prop status row, one indicator per known prop player
         prop_host = QWidget()
         prop_row = QHBoxLayout(prop_host)
         prop_row.setContentsMargins(0, 0, 0, 0)
@@ -247,7 +500,7 @@ class MonitorWindow(QMainWindow):
 
         root.addSpacing(40)
 
-        # bottom controls
+        # bottom controls: [broadcast] ... [input] seconds [Start] [Exit]
         controls = QWidget()
         cl = QHBoxLayout(controls)
         cl.setContentsMargins(0, 0, 0, 0)
@@ -261,6 +514,7 @@ class MonitorWindow(QMainWindow):
 
         cl.addStretch()
 
+        # music offset (seconds): +ve = music ahead of broadcast
         self.offset_input = QLineEdit(f"{self.controller.music_offset:g}")
         self.offset_input.setFixedWidth(70)
         self.offset_input.setMinimumHeight(44)
@@ -275,7 +529,6 @@ class MonitorWindow(QMainWindow):
             }}
         """)
         self.offset_input.editingFinished.connect(self._on_offset_changed)
-        self.offset_input.installEventFilter(self)  # <--- 加入事件攔截器
         cl.addWidget(self.offset_input)
 
         offset_label = QLabel("offset")
@@ -298,7 +551,6 @@ class MonitorWindow(QMainWindow):
             }}
         """)
         self.time_input.editingFinished.connect(self._on_input_changed)
-        self.time_input.installEventFilter(self)  # <--- 加入事件攔截器
         cl.addWidget(self.time_input)
 
         sec_label = QLabel("seconds")
@@ -330,7 +582,24 @@ class MonitorWindow(QMainWindow):
         self.exit_button.clicked.connect(self._exit_action)
         cl.addWidget(self.exit_button)
 
+        cl.addSpacing(16)
+
+        self.waveform_widget = WaveformWidget(self._current_music_seconds,
+                                              future_seconds=12.0)
+        self.waveform_widget.load_file(getattr(self.controller, "music_file", None))
+        cl.addWidget(self.waveform_widget)
+
         root.addWidget(controls)
+
+    def _current_music_seconds(self):
+        """Return the actual MP3 time shown in the waveform preview."""
+        music_player = getattr(self.controller, "music_player", None)
+        if music_player is not None:
+            player = music_player.player
+            pos_ms = player.position()
+            if self.controller.isRunning or pos_ms > 0:
+                return max(0.0, pos_ms / 1000.0)
+        return max(0.0, self.get_time_value() + self.controller.music_offset)
 
     def _style_toggle(self, running):
         bg = DANGER if running else ACCENT
@@ -363,6 +632,7 @@ class MonitorWindow(QMainWindow):
             time_str_raw = self.time_input.text().strip()
             time_str_raw = time_str_raw.replace(";", ":")
             if ":" in time_str_raw:
+                # if format MM:SS return MM*60 + SS
                 parts = time_str_raw.split(":")
                 if len(parts) == 2:
                     minutes = float(parts[0]) if parts[0] else 0
@@ -445,27 +715,5 @@ class MonitorWindow(QMainWindow):
         for pn, w in self.props.items():
             w.set_online(pn in online_props)
 
-    # ---- 事件攔截器 (Event Filter) ----
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.KeyPress:
-            if event.key() == Qt.Key_Space:
-                self._toggle_playback()
-                return True
-        return super().eventFilter(obj, event)
-
-    def keyPressEvent(self, event):
-        focused_widget = self.focusWidget()
-
-        if isinstance(focused_widget, QLineEdit):
-            super().keyPressEvent(event)
-            return
-
-        if event.key() == Qt.Key_Backspace:
-            self.time_input.setFocus()
-            self.time_input.selectAll()
-            
-        elif event.key() == Qt.Key_Space:
-            self._toggle_playback()
-            
-        else:
-            super().keyPressEvent(event)
+        if hasattr(self, "waveform_widget"):
+            self.waveform_widget.update()
