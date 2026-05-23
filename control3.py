@@ -22,7 +22,8 @@ from ui import MonitorWindow, PART_NAMES
 # ============================================================
 # CONFIG
 # ============================================================
-MUSIC_FILE = r"C:\School_2025\LightDance\picow-pio-template\test music\2026_show.mp3"
+MUSIC_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "2026_show.mp3")
 MUSIC_OFFSET = 0.2  # +ve = music ahead of broadcast, -ve = behind
 
 LIGHTDATA_FILE = os.path.join(
